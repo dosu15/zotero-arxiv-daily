@@ -9,7 +9,7 @@ from datetime import datetime
 from .reranker import get_reranker_cls
 from .construct_email import render_email
 from .utils import send_email
-from openai import OpenAI
+# from openai import OpenAI
 from tqdm import tqdm
 
 
