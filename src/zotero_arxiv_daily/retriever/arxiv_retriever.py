@@ -114,148 +114,135 @@ class ArxivRetriever(BaseRetriever):
             raise ValueError("category must be specified for arxiv.")
 
     def _retrieve_raw_papers(self) -> list[ArxivResult]:
-    # 不建议这里再设 10 次内部重试，否则会和下面的外层重试叠加，
-    # 一次失败可能卡非常久。
-    client = arxiv.Client(num_retries=3, delay_seconds=10)
+        client = arxiv.Client(num_retries=3, delay_seconds=10)
 
-    query = '+'.join(self.config.source.arxiv.category)
-    include_cross_list = self.config.source.arxiv.get(
-        "include_cross_list", False
-    )
+        query = '+'.join(self.config.source.arxiv.category)
+        include_cross_list = self.config.source.arxiv.get(
+            "include_cross_list", False
+        )
 
-    # Get the latest papers from arXiv RSS feed
-    feed = feedparser.parse(f"https://rss.arxiv.org/atom/{query}")
+        # Get the latest papers from arXiv RSS feed
+        feed = feedparser.parse(f"https://rss.arxiv.org/atom/{query}")
 
-    if 'Feed error for query' in feed.feed.title:
-        raise Exception(f"Invalid ARXIV_QUERY: {query}.")
+        if 'Feed error for query' in feed.feed.title:
+            raise Exception(f"Invalid ARXIV_QUERY: {query}.")
 
-    raw_papers = []
+        raw_papers = []
 
-    allowed_announce_types = (
-        {"new", "cross"} if include_cross_list else {"new"}
-    )
+        allowed_announce_types = (
+            {"new", "cross"} if include_cross_list else {"new"}
+        )
 
-    all_paper_ids = [
-        item.id.removeprefix("oai:arXiv.org:")
-        for item in feed.entries
-        if item.get("arxiv_announce_type", "new")
-        in allowed_announce_types
-    ]
+        all_paper_ids = [
+            item.id.removeprefix("oai:arXiv.org:")
+            for item in feed.entries
+            if item.get("arxiv_announce_type", "new")
+            in allowed_announce_types
+        ]
 
-    if self.config.executor.debug:
-        all_paper_ids = all_paper_ids[:10]
+        if self.config.executor.debug:
+            all_paper_ids = all_paper_ids[:10]
 
-    bar = tqdm(total=len(all_paper_ids))
+        bar = tqdm(total=len(all_paper_ids))
 
-    # 每批仍然保持 20 篇，避免因为 batch 太小反而增加 API 请求数量
-    batch_size = 20
+        batch_size = 20
+        max_batch_retries = 3
+        batch_retry_delay = 30
 
-    # 外层只尝试 3 次即可。
-    # arxiv.Client 内部本身还会 retry。
-    max_batch_retries = 3
+        for i in range(0, len(all_paper_ids), batch_size):
+            batch_ids = all_paper_ids[i:i + batch_size]
+            batch_number = i // batch_size
 
-    for i in range(0, len(all_paper_ids), batch_size):
-        batch_ids = all_paper_ids[i:i + batch_size]
-        batch_number = i // batch_size
+            search = arxiv.Search(id_list=batch_ids)
 
-        search = arxiv.Search(id_list=batch_ids)
+            batch_success = False
 
-        batch_success = False
-
-        for attempt in range(max_batch_retries):
-            try:
-                batch = list(client.results(search))
-
-                raw_papers.extend(batch)
-                bar.update(len(batch))
-
-                batch_success = True
-                break
-
-            except arxiv.HTTPError as exc:
-                # 429: Too Many Requests
-                # 503: arXiv temporarily unavailable
-                if exc.status in (429, 503):
-                    if attempt < max_batch_retries - 1:
-                        wait = 30 * (attempt + 1)
-
-                        logger.warning(
-                            f"arXiv API HTTP {exc.status} on "
-                            f"batch {batch_number}, "
-                            f"retry {attempt + 1}/"
-                            f"{max_batch_retries - 1} "
-                            f"in {wait}s"
-                        )
-
-                        sleep(wait)
-                        continue
-
-                logger.warning(
-                    f"arXiv batch {batch_number} failed "
-                    f"with HTTP {exc.status}. "
-                    f"Falling back to per-paper requests."
-                )
-
-                break
-
-        # ---------------------------------------------------------
-        # 批量查询失败：
-        # 不再让整个 workflow 退出，而是逐篇请求
-        # ---------------------------------------------------------
-        if not batch_success:
-            logger.warning(
-                f"Falling back to per-paper requests "
-                f"for batch {batch_number} "
-                f"({len(batch_ids)} papers)"
-            )
-
-            for index, paper_id in enumerate(batch_ids):
+            for attempt in range(max_batch_retries):
                 try:
-                    single_search = arxiv.Search(
-                        id_list=[paper_id]
-                    )
+                    batch = list(client.results(search))
 
-                    result = list(
-                        client.results(single_search)
-                    )
+                    raw_papers.extend(batch)
+                    bar.update(len(batch))
 
-                    raw_papers.extend(result)
-                    bar.update(len(result))
+                    batch_success = True
+                    break
 
                 except arxiv.HTTPError as exc:
+                    if exc.status in (429, 503):
+                        if attempt < max_batch_retries - 1:
+                            wait = batch_retry_delay * (attempt + 1)
+
+                            logger.warning(
+                                f"arXiv API HTTP {exc.status} on "
+                                f"batch {batch_number}, "
+                                f"retry {attempt + 1}/"
+                                f"{max_batch_retries - 1} "
+                                f"in {wait}s"
+                            )
+
+                            sleep(wait)
+                            continue
+
                     logger.warning(
-                        f"Skipping arXiv paper "
-                        f"{paper_id}: HTTP {exc.status}"
+                        f"arXiv batch {batch_number} failed "
+                        f"with HTTP {exc.status}. "
+                        f"Falling back to per-paper requests."
                     )
 
-                    # 即使这一篇失败，也继续下一篇
-                    bar.update(1)
+                    break
 
-                except Exception as exc:
-                    logger.warning(
-                        f"Skipping arXiv paper "
-                        f"{paper_id}: {exc}"
-                    )
+            # Batch failed: fall back to per-paper requests
+            if not batch_success:
+                logger.warning(
+                    f"Falling back to per-paper requests "
+                    f"for batch {batch_number} "
+                    f"({len(batch_ids)} papers)"
+                )
 
-                    bar.update(1)
+                for index, paper_id in enumerate(batch_ids):
+                    try:
+                        single_search = arxiv.Search(
+                            id_list=[paper_id]
+                        )
 
-                # 单篇请求之间主动限速
-                if index + 1 < len(batch_ids):
-                    sleep(2)
+                        result = list(
+                            client.results(single_search)
+                        )
 
-        # batch 与 batch 之间也主动限速
-        if i + batch_size < len(all_paper_ids):
-            sleep(5)
+                        raw_papers.extend(result)
+                        bar.update(len(result))
 
-    bar.close()
+                    except arxiv.HTTPError as exc:
+                        logger.warning(
+                            f"Skipping arXiv paper "
+                            f"{paper_id}: HTTP {exc.status}"
+                        )
 
-    logger.info(
-        f"Successfully retrieved "
-        f"{len(raw_papers)}/"
-        f"{len(all_paper_ids)} arXiv papers"
-    )
+                        bar.update(1)
 
-    return raw_papers
+                    except Exception as exc:
+                        logger.warning(
+                            f"Skipping arXiv paper "
+                            f"{paper_id}: {exc}"
+                        )
+
+                        bar.update(1)
+
+                    if index + 1 < len(batch_ids):
+                        sleep(2)
+
+            if i + batch_size < len(all_paper_ids):
+                sleep(5)
+
+        bar.close()
+
+        logger.info(
+            f"Successfully retrieved "
+            f"{len(raw_papers)}/"
+            f"{len(all_paper_ids)} arXiv papers"
+        )
+
+        return raw_papers
 
     def convert_to_paper(self, raw_paper: ArxivResult) -> Paper:
         title = raw_paper.title
